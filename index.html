@@ -476,7 +476,7 @@ function offerWorkshopJump(wsKey){
   setTimeout(()=>btn.classList.remove('ws-pulse'), 2600);
 }
 function log(kind, summary, ref){
-  STATE.change_log.unshift({id: uid(), at: nowISO(), by: CURRENT_USER, kind, summary, ref: ref||null});
+  STATE.change_log.unshift({id: uid(), at: nowISO(), by: CURRENT_USER, kind, summary, ref: ref||null, workshop: CURRENT_WORKSHOP});
   if(typeof scheduleSync === 'function') scheduleSync();
   STATE.last_updated = nowISO();
 }
@@ -2566,7 +2566,8 @@ function rowsFromState(state){
     changeLog[c.id] = {
       id: c.id, at: c.at || new Date().toISOString(), by_user: c.by || null,
       kind: c.kind || null, summary: c.summary || null,
-      ref_id: c.ref == null ? null : String(c.ref)
+      ref_id: c.ref == null ? null : String(c.ref),
+      workshop_id: c.workshop || null
     };
   });
   return { batches, orders, cancellations, change_log: changeLog };
@@ -2648,7 +2649,7 @@ function stateFromRows(batchRows, orderRows, cancelRows, logRows, workshopRows){
                last_workshop:c.last_workshop, snapshot:c.snapshot }));
   state.change_log = (logRows || [])
     .sort((a,b)=>String(b.at||'').localeCompare(String(a.at||'')))
-    .map(c=>({ id:c.id, at:c.at, by:c.by_user, kind:c.kind, summary:c.summary, ref:c.ref_id }));
+    .map(c=>({ id:c.id, at:c.at, by:c.by_user, kind:c.kind, summary:c.summary, ref:c.ref_id, workshop:c.workshop_id }));
 
   // strip the sort helper
   Object.values(state.workshops).forEach(w=>{
@@ -2970,8 +2971,9 @@ async function loadProfile(){
   const { data, error } = await SB.from('profiles').select('*').eq('id', user.id).maybeSingle();
   if(error) throw error;
   return data
-    ? { id: user.id, email: user.email, display_name: data.display_name || user.email, role: data.role || 'editor' }
-    : { id: user.id, email: user.email, display_name: user.email, role: 'editor' };
+    ? { id: user.id, email: user.email, display_name: data.display_name || user.email,
+        role: data.role || 'editor', workshop: data.workshop_id || null }
+    : { id: user.id, email: user.email, display_name: user.email, role: 'editor', workshop: null };
 }
 
 function applyRole(){
@@ -2989,6 +2991,30 @@ function applyRole(){
   const who = document.getElementById('whoAmI');
   if(who) who.textContent = `${PROFILE.display_name}${PROFILE.role === 'admin' ? ' · admin' : ''}`;
   CURRENT_USER = PROFILE.display_name;
+
+  // An account tied to one workshop never receives the other shop's rows, so
+  // most of this is already handled by the database. These are the cosmetic
+  // leftovers: a workshop switcher with one option, and an empty pool tab.
+  const scoped = !!(PROFILE && PROFILE.workshop);
+  document.body.classList.toggle('scoped', scoped);
+  const bar = document.getElementById('workshopBar');
+  if(bar) bar.style.display = scoped ? 'none' : '';
+  const unassignedTab = document.querySelector('nav.tabs button[data-tab="unassigned"]');
+  if(unassignedTab) unassignedTab.style.display = scoped ? 'none' : '';
+  const brand = document.querySelector('header .brand');
+  if(brand){
+    let tag = document.getElementById('scopeTag');
+    if(scoped && !tag){
+      tag = document.createElement('span');
+      tag.id = 'scopeTag';
+      tag.style.cssText = 'font-size:11px;padding:2px 8px;border-radius:999px;background:#33404f;color:#dfe7f0;letter-spacing:.3px;margin-left:6px';
+      brand.after(tag);
+    }
+    if(tag){
+      tag.style.display = scoped ? '' : 'none';
+      tag.textContent = scoped ? PROFILE.workshop : '';
+    }
+  }
 }
 
 async function bootAfterAuth(){
@@ -3092,6 +3118,7 @@ async function runDiagnostics(){
     add('Signed in', !!session, session ? session.user.email : 'no session');
   }catch(e){ add('Signed in', false, humanError(e)); }
   add('Role', !!PROFILE, PROFILE ? `${PROFILE.display_name} · ${PROFILE.role}` : 'no profile row');
+  add('Workshop scope', true, PROFILE && PROFILE.workshop ? `${PROFILE.workshop} only` : 'both workshops');
   for(const t of ['workshops','batches','orders','cancellations','change_log','profiles']){
     try{
       const { error, count } = await SB.from(t).select('*', { count: 'exact', head: true });
