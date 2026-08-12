@@ -233,6 +233,7 @@ var o=[];var l=Array.isArray(e);for(f=n.s.c;f<=n.e.c;++f)s[f]=ya(f);for(var c=n.
   <span style="font-size:12px;color:#bbb">Signed in as <b id="whoAmI" style="color:#fff">…</b></span>
   <button id="importBtn" class="admin-only" title="Import Katana export">Import Katana</button>
   <span id="syncPill" title="" style="font-size:11.5px;font-weight:600;padding:4px 10px;border-radius:999px;background:#e6e4dd;color:#6b6b6b;white-space:nowrap">●  Connecting…</span>
+  <button id="shipCsvBtn" title="Download a CSV of every order in the active queue with its batch's projected ship date">Ship Dates CSV</button>
   <button id="sentCsvBtn" title="Download a CSV of every order marked Track. Sent, with its sent date (for accounting)">Sent Dates CSV</button>
   <button id="saveBtn" class="admin-only" title="Download queue-state.json (backup)">Backup JSON</button>
   <button id="diagBtn" class="admin-only" title="Check the connection to the shared queue">Connection test</button>
@@ -857,6 +858,7 @@ function init(){
   };
   $('#saveBtn').onclick = saveState;
   $('#sentCsvBtn').onclick = exportSentDatesCSV;
+  $('#shipCsvBtn').onclick = exportShipDatesCSV;
   $('#diagBtn').onclick = runDiagnostics;
   $('#closePanel').onclick = ()=>$('#orderPanel').classList.remove('open');
   // import drop
@@ -1872,6 +1874,56 @@ function sendToUnassigned(workshop, batchId, orderId, reason){
   toast('Moved to unassigned queue');
 }
 
+/* ---------- Ship Dates CSV (what's going out, and when) ---------- */
+// Order numbers against the projected ship date of the batch they sit in.
+// Active batches only — past batches have already shipped.
+function exportShipDatesCSV(){
+  const q = s => `"${String(s==null?'':s).replace(/"/g,'""')}"`;
+  const rows = [['Projected Ship Date','Order #','Customer','Sauna Units','Size','Workshop','Batch','MO Status','Track. Sent','Sent Date','Notes']];
+  const collected = [];
+  Object.entries(STATE.workshops).forEach(([wn, w])=>{
+    (w.batches||[]).forEach(b=>{
+      (b.orders||[]).forEach(o=>{
+        collected.push({
+          key: b.projected_ship_date || '9999-99-99',
+          row: [
+            formatShipDate(b.projected_ship_date) || 'not set',
+            o.order_no || '',
+            o.customer || '',
+            orderUnits(o),
+            o.size || b.size || '',
+            wn,
+            bShort(b),
+            b.mo_status === 'finalized' ? 'Finalized' : 'Projected',
+            (o.statuses && o.statuses.tracking_sent) ? 'yes' : 'no',
+            o.sent_date ? formatShipDate(o.sent_date) : '',
+            o.notes || ''
+          ]
+        });
+      });
+    });
+  });
+  // Orders with no workshop yet have no ship date — listed last so they're visible, not buried.
+  (STATE.unassigned||[]).forEach(o=>{
+    collected.push({
+      key: 'zzzz',
+      row: ['unassigned', o.order_no||'', o.customer||'', orderUnits(o), o.size||'',
+            'Unassigned (The Hot Box Sauna)', '—', '', 'no', '', o.notes||'']
+    });
+  });
+  if(!collected.length){ toast('No orders in the active queue.'); return; }
+  collected.sort((a,b)=>a.key.localeCompare(b.key));
+  collected.forEach(c=>rows.push(c.row));
+  const csv = rows.map(r=>r.map(q).join(',')).join('\r\n');
+  const blob = new Blob(['﻿'+csv], {type:'text/csv;charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `thbs-ship-dates-${todayLocalISO()}.csv`;
+  document.body.appendChild(a); a.click(); a.remove();
+  const undated = collected.filter(c=>c.key === '9999-99-99').length;
+  toast(`Exported ${collected.length} order${collected.length===1?'':'s'}${undated?` · ${undated} with no ship date set`:''}`);
+}
+
 /* ---------- Sent Dates CSV (accounting export) ---------- */
 function exportSentDatesCSV(){
   const rows = [['Sent Date','Order #','Customer','Sauna Units','Workshop','Batch','Size','Batch Status','Projected Ship Date','Recorded By','Notes']];
@@ -2638,7 +2690,7 @@ async function pullState({ render = true } = {}){
     }
     const keepWorkshop = CURRENT_WORKSHOP;
     STATE = stateFromRows(batches, orders, cancels, logs, workshops);
-    SYNCED = rowsFromState(STATE);
+    SYNCED = snapshotRows(rowsFromState(STATE));
     if(STATE.workshops[keepWorkshop]) CURRENT_WORKSHOP = keepWorkshop;
     else CURRENT_WORKSHOP = Object.keys(STATE.workshops)[0];
     if(render){ init(); }
@@ -2652,6 +2704,22 @@ async function pullState({ render = true } = {}){
 }
 
 /* ---------- push (diff) ---------- */
+// The synced snapshot is stored as JSON STRINGS, one per row — never as row
+// objects. Row objects hold references straight into STATE (statuses, options,
+// katana, history are all objects), so a snapshot made of them mutates in step
+// with the live data: ticking a checkbox changed both sides at once, the diff
+// compared the row against itself, saw nothing, and never wrote it. Strings are
+// a real point-in-time copy and cheaper to compare.
+function snapshotRows(rows){
+  const out = {};
+  Object.keys(rows).forEach(table=>{
+    const m = {};
+    Object.keys(rows[table]).forEach(id=>{ m[id] = JSON.stringify(rows[table][id]); });
+    out[table] = m;
+  });
+  return out;
+}
+
 // Inserts and updates are kept apart on purpose. An upsert is an
 // INSERT ... ON CONFLICT, so Postgres checks the INSERT policy even when the
 // row already exists — which means an editor ticking a checkbox would be
@@ -2659,9 +2727,9 @@ async function pullState({ render = true } = {}){
 function diffTable(now, before){
   const inserts = [], updates = [], deletes = [];
   Object.keys(now).forEach(id=>{
-    const a = now[id], b = before ? before[id] : undefined;
-    if(!b) inserts.push(a);
-    else if(JSON.stringify(a) !== JSON.stringify(b)) updates.push(a);
+    const prev = before ? before[id] : undefined;
+    if(prev === undefined) inserts.push(now[id]);
+    else if(JSON.stringify(now[id]) !== prev) updates.push(now[id]);
   });
   if(before) Object.keys(before).forEach(id=>{ if(!now[id]) deletes.push(id); });
   return { inserts, updates, deletes };
@@ -2702,7 +2770,7 @@ async function pushDiff(){
     await chunkDelete('orders', plan.orders.deletes);
     await chunkDelete('batches', plan.batches.deletes);
     await chunkDelete('cancellations', plan.cancellations.deletes);
-    SYNCED = now;
+    SYNCED = snapshotRows(now);
     LAST_ERROR = null;
     setSync('ok');
   }catch(err){
